@@ -136,28 +136,28 @@ install_packages() {
 }
 
 # =============================================================================
-# 3. CONFIGURE DHCPCD — static IP on AP interface
+# 3. CONFIGURE STATIC IP — on AP interface via NetworkManager
 # =============================================================================
-configure_dhcpcd() {
-    log_step "Configuring dhcpcd (static IP for $IF_AP)"
+configure_static_ip() {
+    log_step "Configuring static IP for $IF_AP"
 
-    local conf="/etc/dhcpcd.conf"
-    backup_file "$conf"
+    # Remove any existing NM connection for the AP interface
+    nmcli connection delete "secure-router-ap" 2>/dev/null || true
 
-    # Remove old managed block if re-running
-    if grep -q "$SENTINEL" "$conf" 2>/dev/null; then
-        sed -i "/$SENTINEL/,/^$/d" "$conf"
-    fi
-
-    cat >> "$conf" << EOF
+    # Tell NetworkManager not to manage wlan0 (hostapd will manage it)
+    mkdir -p /etc/NetworkManager/conf.d
+    cat > /etc/NetworkManager/conf.d/secure-router.conf << EOF
 $SENTINEL
-interface $IF_AP
-    static ip_address=${AP_GW}/24
-    nohook wpa_supplicant
-
+[keyfile]
+unmanaged-devices=interface-name:$IF_AP
 EOF
 
-    log_ok "Static IP ${AP_GW}/24 set on $IF_AP"
+    # Set the static IP directly
+    ip addr flush dev "$IF_AP" 2>/dev/null || true
+    ip addr add "${AP_GW}/24" dev "$IF_AP" 2>/dev/null || true
+    ip link set "$IF_AP" up
+
+    log_ok "Static IP ${AP_GW}/24 set on $IF_AP (unmanaged by NM)"
 }
 
 # =============================================================================
@@ -225,29 +225,26 @@ EOF
 }
 
 # =============================================================================
-# 6. CONFIGURE WPA_SUPPLICANT — connect to public Wi-Fi uplink
+# 6. CONFIGURE UPLINK — connect to phone hotspot via NetworkManager
 # =============================================================================
-configure_wpa_supplicant() {
-    log_step "Configuring wpa_supplicant (public Wi-Fi uplink on $IF_UPLINK)"
+configure_uplink() {
+    log_step "Configuring Wi-Fi uplink on $IF_UPLINK via NetworkManager"
 
-    local conf="/etc/wpa_supplicant/wpa_supplicant-${IF_UPLINK}.conf"
+    # Remove old connection if re-running
+    nmcli connection delete "phone-uplink" 2>/dev/null || true
 
-    cat > "$conf" << EOF
-$SENTINEL
-ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
-update_config=1
-country=$AP_COUNTRY
+    # Create a new Wi-Fi connection on the uplink interface
+    nmcli connection add \
+        type wifi \
+        con-name "phone-uplink" \
+        ifname "$IF_UPLINK" \
+        ssid "$UPLINK_SSID" \
+        wifi-sec.key-mgmt wpa-psk \
+        wifi-sec.psk "$UPLINK_PASS" \
+        connection.autoconnect yes \
+        ipv4.route-metric "$UPLINK_METRIC"
 
-network={
-    ssid="$UPLINK_SSID"
-    psk="$UPLINK_PASS"
-    key_mgmt=WPA-PSK
-    priority=1
-}
-EOF
-
-    chmod 600 "$conf"
-    log_ok "Wi-Fi uplink: SSID=$UPLINK_SSID"
+    log_ok "Wi-Fi uplink: SSID=$UPLINK_SSID (on $IF_UPLINK, metric $UPLINK_METRIC)"
 }
 
 # =============================================================================
@@ -273,6 +270,19 @@ configure_routing() {
     log_step "Configuring routing tables"
 
     local rt="/etc/iproute2/rt_tables"
+
+    # Create rt_tables if it doesn't exist
+    if [[ ! -f "$rt" ]]; then
+        mkdir -p /etc/iproute2
+        cat > "$rt" << RTEOF
+# routing tables
+255 local
+254 main
+253 default
+0 unspec
+RTEOF
+        log_ok "Created $rt"
+    fi
 
     grep -q "^${UPLINK_TABLE} " "$rt" 2>/dev/null || echo "${UPLINK_TABLE} uplink" >> "$rt"
     grep -q "^${BT_TABLE} " "$rt" 2>/dev/null || echo "${BT_TABLE} bluetooth" >> "$rt"
@@ -334,15 +344,21 @@ configure_firewall() {
 }
 
 # =============================================================================
-# 10. DHCPCD EXIT HOOK — dynamic uplink failover routing
+# 10. NETWORKMANAGER DISPATCHER — dynamic uplink failover routing
 # =============================================================================
-write_dhcpcd_hook() {
-    log_step "Writing dhcpcd exit hook (uplink failover)"
+write_nm_dispatcher() {
+    log_step "Writing NetworkManager dispatcher (uplink failover)"
 
-    cat > /etc/dhcpcd.exit-hook << 'HOOKEOF'
+    mkdir -p /etc/NetworkManager/dispatcher.d
+
+    cat > /etc/NetworkManager/dispatcher.d/50-secure-router-failover << 'HOOKEOF'
 #!/usr/bin/env bash
 # Secure Router — dynamic uplink failover
-# Called by dhcpcd when interfaces get/lose DHCP leases
+# Called by NetworkManager when interface state changes
+# Args: $1 = interface, $2 = action
+
+IFACE="$1"
+ACTION="$2"
 
 IF_UPLINK="wlan1"
 IF_BT="bnep0"
@@ -351,33 +367,37 @@ BT_TABLE=200
 UPLINK_METRIC=100
 BT_METRIC=200
 
-case "$reason" in
-    BOUND|RENEW|REBIND|REBOOT)
-        if [[ "$interface" == "$IF_UPLINK" ]]; then
-            ip route flush table $UPLINK_TABLE 2>/dev/null || true
-            ip route add default via "$new_routers" dev "$IF_UPLINK" table $UPLINK_TABLE 2>/dev/null || true
-            ip rule add from all lookup $UPLINK_TABLE priority $UPLINK_METRIC 2>/dev/null || true
-            # Update main table default route
-            ip route replace default via "$new_routers" dev "$IF_UPLINK" metric $UPLINK_METRIC 2>/dev/null || true
+case "$ACTION" in
+    up|dhcp4-change)
+        if [[ "$IFACE" == "$IF_UPLINK" ]]; then
+            GW=$(ip route show dev "$IF_UPLINK" | grep default | awk '{print $3}' | head -1)
+            if [[ -n "$GW" ]]; then
+                ip route flush table $UPLINK_TABLE 2>/dev/null || true
+                ip route add default via "$GW" dev "$IF_UPLINK" table $UPLINK_TABLE 2>/dev/null || true
+                ip rule add from all lookup $UPLINK_TABLE priority $UPLINK_METRIC 2>/dev/null || true
+                ip route replace default via "$GW" dev "$IF_UPLINK" metric $UPLINK_METRIC 2>/dev/null || true
+            fi
         fi
 
-        if [[ "$interface" == "$IF_BT" ]]; then
-            ip route flush table $BT_TABLE 2>/dev/null || true
-            ip route add default via "$new_routers" dev "$IF_BT" table $BT_TABLE 2>/dev/null || true
-            ip rule add from all lookup $BT_TABLE priority $BT_METRIC 2>/dev/null || true
-            # Update main table default route (higher metric = fallback)
-            ip route replace default via "$new_routers" dev "$IF_BT" metric $BT_METRIC 2>/dev/null || true
+        if [[ "$IFACE" == "$IF_BT" ]]; then
+            GW=$(ip route show dev "$IF_BT" | grep default | awk '{print $3}' | head -1)
+            if [[ -n "$GW" ]]; then
+                ip route flush table $BT_TABLE 2>/dev/null || true
+                ip route add default via "$GW" dev "$IF_BT" table $BT_TABLE 2>/dev/null || true
+                ip rule add from all lookup $BT_TABLE priority $BT_METRIC 2>/dev/null || true
+                ip route replace default via "$GW" dev "$IF_BT" metric $BT_METRIC 2>/dev/null || true
+            fi
         fi
         ;;
 
-    EXPIRE|RELEASE|NOCARRIER)
-        if [[ "$interface" == "$IF_UPLINK" ]]; then
+    down)
+        if [[ "$IFACE" == "$IF_UPLINK" ]]; then
             ip route flush table $UPLINK_TABLE 2>/dev/null || true
             ip rule del lookup $UPLINK_TABLE 2>/dev/null || true
             ip route del default dev "$IF_UPLINK" 2>/dev/null || true
         fi
 
-        if [[ "$interface" == "$IF_BT" ]]; then
+        if [[ "$IFACE" == "$IF_BT" ]]; then
             ip route flush table $BT_TABLE 2>/dev/null || true
             ip rule del lookup $BT_TABLE 2>/dev/null || true
             ip route del default dev "$IF_BT" 2>/dev/null || true
@@ -386,8 +406,8 @@ case "$reason" in
 esac
 HOOKEOF
 
-    chmod +x /etc/dhcpcd.exit-hook
-    log_ok "Failover hook installed at /etc/dhcpcd.exit-hook"
+    chmod +x /etc/NetworkManager/dispatcher.d/50-secure-router-failover
+    log_ok "Failover dispatcher installed at /etc/NetworkManager/dispatcher.d/50-secure-router-failover"
 }
 
 # =============================================================================
@@ -405,13 +425,9 @@ enable_services() {
     systemctl enable dnsmasq
     log_ok "dnsmasq enabled"
 
-    # Enable dhcpcd
-    systemctl enable dhcpcd
-    log_ok "dhcpcd enabled"
-
-    # Enable wpa_supplicant for uplink interface
-    systemctl enable "wpa_supplicant@${IF_UPLINK}" 2>/dev/null || true
-    log_ok "wpa_supplicant@${IF_UPLINK} enabled"
+    # NetworkManager handles DHCP and uplink — reload its config
+    nmcli general reload
+    log_ok "NetworkManager reloaded"
 
     # Enable Bluetooth
     systemctl enable bluetooth 2>/dev/null || true
@@ -470,14 +486,14 @@ main() {
 
     check_prereqs
     install_packages
-    configure_dhcpcd
+    configure_static_ip
     configure_hostapd
     configure_dnsmasq
-    configure_wpa_supplicant
+    configure_uplink
     configure_sysctl
     configure_routing
     configure_firewall
-    write_dhcpcd_hook
+    write_nm_dispatcher
     enable_services
     print_summary
 }
