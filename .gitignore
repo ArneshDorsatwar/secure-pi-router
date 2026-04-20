@@ -1,0 +1,4 @@
+_setup_pi_remote.py
+wg0-pi-config.conf
+*.key
+*.pub
