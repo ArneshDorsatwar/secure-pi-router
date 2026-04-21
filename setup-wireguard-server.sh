@@ -86,7 +86,9 @@ Address = ${SERVER_IP}/24
 ListenPort = ${WG_PORT}
 PrivateKey = ${SERVER_PRIV}
 
-PostUp = iptables -A FORWARD -i ${WG_IFACE} -j ACCEPT; iptables -A FORWARD -o ${WG_IFACE} -j ACCEPT; iptables -t nat -A POSTROUTING -o ${OUT_IFACE} -j MASQUERADE
+# Insert at TOP of FORWARD (-I) — Oracle/RHEL Ubuntu images have a default REJECT
+# rule near the top that drops forwarded traffic if we only append (-A).
+PostUp = iptables -I FORWARD 1 -i ${WG_IFACE} -j ACCEPT; iptables -I FORWARD 2 -o ${WG_IFACE} -j ACCEPT; iptables -t nat -A POSTROUTING -o ${OUT_IFACE} -j MASQUERADE
 PostDown = iptables -D FORWARD -i ${WG_IFACE} -j ACCEPT; iptables -D FORWARD -o ${WG_IFACE} -j ACCEPT; iptables -t nat -D POSTROUTING -o ${OUT_IFACE} -j MASQUERADE
 
 [Peer]
