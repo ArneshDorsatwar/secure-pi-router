@@ -356,7 +356,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 config = conf_path.read_text()
                 qr_bytes = subprocess.check_output(
-                    ["qrencode", "-t", "PNG", "-s", "8", "-m", "2"],
+                    ["qrencode", "-t", "PNG", "-s", "8", "-m", "2", "-o", "-"],
                     input=config.encode(),
                 )
                 qr_b64 = base64.b64encode(qr_bytes).decode()
