@@ -1,0 +1,2 @@
+paramiko>=3.0
+PySocks>=1.7
