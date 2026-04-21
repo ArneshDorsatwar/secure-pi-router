@@ -77,7 +77,8 @@ cat > "$CLIENT_CONF" << EOF
 # $NAME
 Address = ${NEXT_IP}/24
 PrivateKey = ${PEER_PRIV}
-DNS = 1.1.1.1, 9.9.9.9
+# DNS points at the VPS's AdGuard Home (ad/tracker blocking)
+DNS = 10.8.0.1
 
 [Peer]
 PublicKey = ${SERVER_PUB}
