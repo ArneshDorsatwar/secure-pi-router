@@ -1,8 +1,10 @@
 _setup_pi_remote.py
 _check_exit_ip.py
 _verify_pi.py
+_update_pi_dns.py
 wg0-pi-config.conf
 laptop-windows.conf
+presentation/
 *.key
 *.pub
 __pycache__/
