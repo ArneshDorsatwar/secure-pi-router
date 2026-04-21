@@ -2,6 +2,7 @@ _setup_pi_remote.py
 _check_exit_ip.py
 _verify_pi.py
 wg0-pi-config.conf
+laptop-windows.conf
 *.key
 *.pub
 __pycache__/
