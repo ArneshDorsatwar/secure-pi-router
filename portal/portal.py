@@ -16,7 +16,7 @@ import secrets
 import shutil
 import subprocess
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote
 
@@ -296,6 +296,14 @@ def admin_page(peers: list[dict]) -> str:
 
 class Handler(BaseHTTPRequestHandler):
 
+    # Kill the default reverse-DNS lookup — massively slows down requests from
+    # random port scanners (and adds no value to our logs, which we silence).
+    def address_string(self) -> str:
+        return self.client_address[0]
+
+    # Drop stalled or malformed connections after 15s instead of hogging a worker.
+    timeout = 15
+
     def _reply(self, status: int, body: str | bytes, ctype: str = "text/html; charset=utf-8") -> None:
         data = body.encode() if isinstance(body, str) else body
         self.send_response(status)
@@ -433,7 +441,9 @@ def main() -> None:
     INVITES_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(INVITES_DIR, 0o700)
     print(f"[*] WireGuard portal listening on :{PORT}")
-    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server.daemon_threads = True   # let the process exit cleanly even if a worker is stuck
+    server.serve_forever()
 
 
 if __name__ == "__main__":
